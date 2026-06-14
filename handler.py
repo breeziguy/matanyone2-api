@@ -45,14 +45,33 @@ def generate_mask(first_frame_np: np.ndarray) -> np.ndarray:
     return (alpha > 127).astype(np.uint8) * 255
 
 
+def resize_frames(frames, max_side=1080):
+    """Downscale frames so the longer side <= max_side, preserving aspect ratio."""
+    h, w = frames[0].shape[:2]
+    if max(h, w) <= max_side:
+        return frames, 1.0
+    scale = max_side / max(h, w)
+    new_w, new_h = int(w * scale), int(h * scale)
+    return [cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA) for f in frames], scale
+
+
 @torch.inference_mode()
 @safe_autocast_decorator()
 def get_alpha_mattes(frames_np, mask_np, n_warmup=10):
-    """Run MatAnyone2 and return per-frame alpha mattes (H,W) uint8."""
-    processor = InferenceCore(matanyone2_model, cfg=matanyone2_model.cfg)
-    mask_tensor = torch.from_numpy(mask_np).to(device)
+    """
+    Run MatAnyone2 at <=1080p to fit in VRAM, then upscale alpha back to original resolution.
+    """
+    orig_h, orig_w = frames_np[0].shape[:2]
 
-    all_frames = [frames_np[0]] * n_warmup + frames_np
+    # Downscale for inference
+    small_frames, _ = resize_frames(frames_np, max_side=1080)
+    sh, sw = small_frames[0].shape[:2]
+    small_mask = cv2.resize(mask_np, (sw, sh), interpolation=cv2.INTER_NEAREST)
+
+    processor = InferenceCore(matanyone2_model, cfg=matanyone2_model.cfg)
+    mask_tensor = torch.from_numpy(small_mask).to(device)
+
+    all_frames = [small_frames[0]] * n_warmup + small_frames
     phas = []
 
     for ti, frame in enumerate(all_frames):
@@ -68,8 +87,10 @@ def get_alpha_mattes(frames_np, mask_np, n_warmup=10):
         mask_tensor = processor.output_prob_to_mask(output_prob)
 
         if ti > (n_warmup - 1):
-            pha = (mask_tensor.cpu().numpy() * 255).astype(np.uint8)
-            phas.append(pha)
+            pha_small = (mask_tensor.cpu().numpy() * 255).astype(np.uint8)
+            # Upscale alpha back to original resolution
+            pha_full = cv2.resize(pha_small, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            phas.append(pha_full)
 
     return phas
 
