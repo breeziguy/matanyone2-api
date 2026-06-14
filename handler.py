@@ -17,7 +17,20 @@ sys.path.insert(0, "/app/MatAnyone2")
 from matanyone2.utils.get_default_model import get_matanyone2_model
 from matanyone2.inference.inference_core import InferenceCore
 from matanyone2.utils.device import get_default_device, safe_autocast_decorator
-from matanyone2.utils.inference_utils import read_frame_from_videos
+
+
+def read_frames_from_video(video_path):
+    """Read video frames using cv2. Returns (frames_np, fps, num_frames)."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    return frames, fps, len(frames)
 
 CKPT_PATH = "/app/pretrained_models/matanyone2.pth"
 device = get_default_device()
@@ -110,11 +123,7 @@ def handler(job):
         with open(input_path, "wb") as f:
             f.write(base64.b64decode(video_b64))
 
-        vframes, fps, length, _ = read_frame_from_videos(input_path)
-        frames_np = [
-            (vframes[i].permute(1, 2, 0).numpy()).astype(np.uint8)
-            for i in range(len(vframes))
-        ]
+        frames_np, fps, length = read_frames_from_video(input_path)
 
         mask_np = generate_mask(frames_np[0])
         fgr_frames, pha_frames = run_matanyone2(frames_np, mask_np, n_warmup=n_warmup)
