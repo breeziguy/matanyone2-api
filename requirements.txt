@@ -1,0 +1,16 @@
+runpod
+torch
+torchvision
+opencv-python-headless
+imageio==2.25.0
+imageio[ffmpeg]
+ffmpeg-python
+numpy
+pillow
+scipy
+einops
+hydra-core
+easydict
+tqdm
+rembg[gpu]
+onnxruntime-gpu
