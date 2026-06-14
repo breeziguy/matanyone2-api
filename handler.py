@@ -2,11 +2,10 @@ import runpod
 import base64
 import tempfile
 import os
+import subprocess
 import cv2
-import imageio
 import numpy as np
 import torch
-import ffmpeg
 from PIL import Image
 from rembg import remove as rembg_remove
 from torchvision.transforms.functional import to_tensor
@@ -18,9 +17,15 @@ from matanyone2.utils.get_default_model import get_matanyone2_model
 from matanyone2.inference.inference_core import InferenceCore
 from matanyone2.utils.device import get_default_device, safe_autocast_decorator
 
+CKPT_PATH = "/app/pretrained_models/matanyone2.pth"
+device = get_default_device()
 
-def read_frames_from_video(video_path):
-    """Read video frames using cv2. Returns (frames_np, fps, num_frames)."""
+print("Loading MatAnyone2 model...")
+matanyone2_model = get_matanyone2_model(CKPT_PATH, device)
+print("Model loaded.")
+
+
+def read_frames(video_path):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     frames = []
@@ -30,41 +35,30 @@ def read_frames_from_video(video_path):
             break
         frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     cap.release()
-    return frames, fps, len(frames)
-
-CKPT_PATH = "/app/pretrained_models/matanyone2.pth"
-device = get_default_device()
-
-print("Loading MatAnyone2 model...")
-matanyone2_model = get_matanyone2_model(CKPT_PATH, device)
-print("Model loaded.")
+    return frames, fps
 
 
 def generate_mask(first_frame_np: np.ndarray) -> np.ndarray:
-    """Auto-segment person in first frame using rembg. Swap this function later for SAM2 or interactive draw."""
-    pil_img = Image.fromarray(first_frame_np)
-    result = rembg_remove(pil_img)
+    """Auto-segment person using rembg. Swap for SAM2 later if needed."""
+    result = rembg_remove(Image.fromarray(first_frame_np))
     alpha = np.array(result)[:, :, 3]
-    mask = (alpha > 127).astype(np.uint8) * 255
-    return mask
+    return (alpha > 127).astype(np.uint8) * 255
 
 
 @torch.inference_mode()
 @safe_autocast_decorator()
-def run_matanyone2(frames_np, mask_np, n_warmup=10):
+def get_alpha_mattes(frames_np, mask_np, n_warmup=10):
+    """Run MatAnyone2 and return per-frame alpha mattes (H,W) uint8."""
     processor = InferenceCore(matanyone2_model, cfg=matanyone2_model.cfg)
     mask_tensor = torch.from_numpy(mask_np).to(device)
-    objects = [1]
 
     all_frames = [frames_np[0]] * n_warmup + frames_np
-    fgrs, phas = [], []
-    bgr = (np.array([120, 255, 155], dtype=np.float32) / 255).reshape((1, 1, 3))
+    phas = []
 
     for ti, frame in enumerate(all_frames):
         image = to_tensor(frame).float().to(device)
-
         if ti == 0:
-            output_prob = processor.step(image, mask_tensor, objects=objects)
+            output_prob = processor.step(image, mask_tensor, objects=[1])
             output_prob = processor.step(image, first_frame_pred=True)
         elif ti <= n_warmup:
             output_prob = processor.step(image, first_frame_pred=True)
@@ -72,40 +66,44 @@ def run_matanyone2(frames_np, mask_np, n_warmup=10):
             output_prob = processor.step(image)
 
         mask_tensor = processor.output_prob_to_mask(output_prob)
-        pha = mask_tensor.unsqueeze(2).cpu().numpy()
-        com = frame / 255.0 * pha + bgr * (1 - pha)
 
         if ti > (n_warmup - 1):
-            fgrs.append((com * 255).astype(np.uint8))
-            phas.append((pha * 255).astype(np.uint8))
+            pha = (mask_tensor.cpu().numpy() * 255).astype(np.uint8)
+            phas.append(pha)
 
-    return fgrs, phas
+    return phas
 
 
-def merge_to_transparent_webm(fgr_frames, pha_frames, fps, output_path):
-    tmp_fgr = output_path.replace(".webm", "_fgr_tmp.mp4")
-    tmp_pha = output_path.replace(".webm", "_pha_tmp.mp4")
+def write_transparent_mov(frames_np, phas, fps, output_path):
+    """
+    Combine original RGB frames + alpha mattes into a ProRes 4444 .mov
+    with a real alpha channel — no green screen, original quality.
+    """
+    h, w = frames_np[0].shape[:2]
 
-    imageio.mimwrite(tmp_fgr, fgr_frames, fps=fps, quality=9)
-    imageio.mimwrite(tmp_pha, [f[:, :, 0] for f in pha_frames], fps=fps, quality=9)
+    # Pipe raw RGBA frames into ffmpeg → ProRes 4444 with alpha
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "rgba",
+        "-s", f"{w}x{h}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        "-vcodec", "prores_ks",
+        "-profile:v", "4444",   # ProRes 4444 — supports alpha
+        "-pix_fmt", "yuva444p10le",
+        "-vendor", "apl0",
+        output_path,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-    (
-        ffmpeg
-        .output(
-            ffmpeg.input(tmp_fgr),
-            ffmpeg.input(tmp_pha),
-            output_path,
-            filter_complex="[0:v][1:v]alphamerge",
-            vcodec="libvpx-vp9",
-            pix_fmt="yuva420p",
-            **{"b:v": "0", "crf": "10"},
-        )
-        .overwrite_output()
-        .run(quiet=True)
-    )
+    for frame_rgb, pha in zip(frames_np, phas):
+        rgba = np.dstack([frame_rgb, pha])   # original color + alpha matte
+        proc.stdin.write(rgba.tobytes())
 
-    os.remove(tmp_fgr)
-    os.remove(tmp_pha)
+    proc.stdin.close()
+    proc.wait()
 
 
 def handler(job):
@@ -117,22 +115,21 @@ def handler(job):
     n_warmup = int(job_input.get("n_warmup", 10))
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.mp4")
-        output_path = os.path.join(tmpdir, "output.webm")
+        input_path = os.path.join(tmpdir, "input.mov")
+        output_path = os.path.join(tmpdir, "output.mov")
 
         with open(input_path, "wb") as f:
             f.write(base64.b64decode(video_b64))
 
-        frames_np, fps, length = read_frames_from_video(input_path)
-
+        frames_np, fps = read_frames(input_path)
         mask_np = generate_mask(frames_np[0])
-        fgr_frames, pha_frames = run_matanyone2(frames_np, mask_np, n_warmup=n_warmup)
-        merge_to_transparent_webm(fgr_frames, pha_frames, fps, output_path)
+        phas = get_alpha_mattes(frames_np, mask_np, n_warmup=n_warmup)
+        write_transparent_mov(frames_np, phas, fps, output_path)
 
         with open(output_path, "rb") as f:
             output_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    return {"video_base64": output_b64, "format": "webm"}
+    return {"video_base64": output_b64, "format": "mov"}
 
 
 runpod.serverless.start({"handler": handler})
