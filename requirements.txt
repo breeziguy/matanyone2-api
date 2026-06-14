@@ -12,5 +12,5 @@ einops
 hydra-core
 easydict
 tqdm
-rembg[gpu]
-onnxruntime-gpu
+rembg
+onnxruntime
