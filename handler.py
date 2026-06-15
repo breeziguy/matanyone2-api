@@ -7,22 +7,14 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from rembg import remove as rembg_remove
-from torchvision.transforms.functional import to_tensor
 
-import sys
-sys.path.insert(0, "/app/MatAnyone2")
+CKPT = "/app/weights/sam2.1_hiera_large.pt"
+CFG  = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
-from matanyone2.utils.get_default_model import get_matanyone2_model
-from matanyone2.inference.inference_core import InferenceCore
-from matanyone2.utils.device import get_default_device, safe_autocast_decorator
-
-CKPT_PATH = "/app/pretrained_models/matanyone2.pth"
-device = get_default_device()
-
-print("Loading MatAnyone2 model...")
-matanyone2_model = get_matanyone2_model(CKPT_PATH, device)
-print("Model loaded.")
+print("Loading SAM2 model...")
+from sam2.build_sam import build_sam2_video_predictor
+predictor = build_sam2_video_predictor(CFG, CKPT)
+print("SAM2 ready.")
 
 
 def read_frames(video_path):
@@ -38,91 +30,63 @@ def read_frames(video_path):
     return frames, fps
 
 
-def generate_mask(first_frame_np: np.ndarray) -> np.ndarray:
-    """Auto-segment person using rembg. Swap for SAM2 later if needed."""
-    result = rembg_remove(Image.fromarray(first_frame_np))
+def get_person_center(frame_rgb):
+    """Find person center using rembg — returns (x, y) in original frame coords."""
+    from rembg import remove
+    result = remove(Image.fromarray(frame_rgb))
     alpha = np.array(result)[:, :, 3]
-    return (alpha > 127).astype(np.uint8) * 255
+    ys, xs = np.where(alpha > 127)
+    if len(xs) == 0:
+        # fallback: center of frame
+        h, w = frame_rgb.shape[:2]
+        return w // 2, h // 2
+    return int(xs.mean()), int(ys.mean())
 
 
-def resize_frames(frames, max_side=1080):
-    """Downscale frames so the longer side <= max_side, preserving aspect ratio."""
+def run_sam2(frames, prompt_x, prompt_y, frames_dir):
+    """Run SAM2 video predictor. Returns list of (H,W) uint8 alpha masks."""
+    # Save frames as JPEG for SAM2 video predictor
+    for i, frame in enumerate(frames):
+        cv2.imwrite(
+            os.path.join(frames_dir, f"{i:05d}.jpg"),
+            cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        )
+
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        state = predictor.init_state(video_path=frames_dir)
+
+        predictor.add_new_points_or_box(
+            inference_state=state,
+            frame_idx=0,
+            obj_id=1,
+            points=np.array([[prompt_x, prompt_y]], dtype=np.float32),
+            labels=np.array([1], dtype=np.int32),
+        )
+
+        masks = {}
+        for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(state):
+            mask = (mask_logits[0][0].cpu().numpy() > 0).astype(np.uint8) * 255
+            masks[frame_idx] = mask
+
+    return [masks[i] for i in range(len(frames))]
+
+
+def write_transparent_mov(frames, alphas, fps, output_path):
+    """Pipe RGBA frames to ffmpeg → ProRes 4444 .mov with alpha channel."""
     h, w = frames[0].shape[:2]
-    if max(h, w) <= max_side:
-        return frames, 1.0
-    scale = max_side / max(h, w)
-    new_w, new_h = int(w * scale), int(h * scale)
-    return [cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA) for f in frames], scale
-
-
-@torch.inference_mode()
-@safe_autocast_decorator()
-def get_alpha_mattes(frames_np, mask_np, n_warmup=10):
-    """
-    Run MatAnyone2 at <=1080p to fit in VRAM, then upscale alpha back to original resolution.
-    """
-    orig_h, orig_w = frames_np[0].shape[:2]
-
-    # Downscale for inference
-    small_frames, _ = resize_frames(frames_np, max_side=1080)
-    sh, sw = small_frames[0].shape[:2]
-    small_mask = cv2.resize(mask_np, (sw, sh), interpolation=cv2.INTER_NEAREST)
-
-    processor = InferenceCore(matanyone2_model, cfg=matanyone2_model.cfg)
-    mask_tensor = torch.from_numpy(small_mask).to(device)
-
-    all_frames = [small_frames[0]] * n_warmup + small_frames
-    phas = []
-
-    for ti, frame in enumerate(all_frames):
-        image = to_tensor(frame).float().to(device)
-        if ti == 0:
-            output_prob = processor.step(image, mask_tensor, objects=[1])
-            output_prob = processor.step(image, first_frame_pred=True)
-        elif ti <= n_warmup:
-            output_prob = processor.step(image, first_frame_pred=True)
-        else:
-            output_prob = processor.step(image)
-
-        mask_tensor = processor.output_prob_to_mask(output_prob)
-
-        if ti > (n_warmup - 1):
-            pha_small = (mask_tensor.cpu().numpy() * 255).astype(np.uint8)
-            # Upscale alpha back to original resolution
-            pha_full = cv2.resize(pha_small, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-            phas.append(pha_full)
-
-    return phas
-
-
-def write_transparent_mov(frames_np, phas, fps, output_path):
-    """
-    Combine original RGB frames + alpha mattes into a ProRes 4444 .mov
-    with a real alpha channel — no green screen, original quality.
-    """
-    h, w = frames_np[0].shape[:2]
-
-    # Pipe raw RGBA frames into ffmpeg → ProRes 4444 with alpha
     cmd = [
         "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
-        "-pix_fmt", "rgba",
-        "-s", f"{w}x{h}",
-        "-r", str(fps),
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-pix_fmt", "rgba", "-s", f"{w}x{h}", "-r", str(fps),
         "-i", "pipe:0",
-        "-vcodec", "prores_ks",
-        "-profile:v", "4444",   # ProRes 4444 — supports alpha
-        "-pix_fmt", "yuva444p10le",
-        "-vendor", "apl0",
+        "-vcodec", "prores_ks", "-profile:v", "4444",
+        "-pix_fmt", "yuva444p10le", "-vendor", "apl0",
         output_path,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-    for frame_rgb, pha in zip(frames_np, phas):
-        rgba = np.dstack([frame_rgb, pha])   # original color + alpha matte
+    for frame_rgb, alpha in zip(frames, alphas):
+        rgba = np.dstack([frame_rgb, alpha])
         proc.stdin.write(rgba.tobytes())
-
     proc.stdin.close()
     proc.wait()
 
@@ -133,19 +97,25 @@ def handler(job):
     if not video_b64:
         return {"error": "Missing video_base64"}
 
-    n_warmup = int(job_input.get("n_warmup", 10))
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.mov")
+        input_path  = os.path.join(tmpdir, "input.mov")
+        frames_dir  = os.path.join(tmpdir, "frames")
         output_path = os.path.join(tmpdir, "output.mov")
+        os.makedirs(frames_dir)
 
         with open(input_path, "wb") as f:
             f.write(base64.b64decode(video_b64))
 
-        frames_np, fps = read_frames(input_path)
-        mask_np = generate_mask(frames_np[0])
-        phas = get_alpha_mattes(frames_np, mask_np, n_warmup=n_warmup)
-        write_transparent_mov(frames_np, phas, fps, output_path)
+        frames, fps = read_frames(input_path)
+
+        # Use provided prompt or auto-detect person center
+        prompt_x = job_input.get("prompt_x")
+        prompt_y = job_input.get("prompt_y")
+        if prompt_x is None or prompt_y is None:
+            prompt_x, prompt_y = get_person_center(frames[0])
+
+        alphas = run_sam2(frames, prompt_x, prompt_y, frames_dir)
+        write_transparent_mov(frames, alphas, fps, output_path)
 
         with open(output_path, "rb") as f:
             output_b64 = base64.b64encode(f.read()).decode("utf-8")

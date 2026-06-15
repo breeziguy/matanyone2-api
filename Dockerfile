@@ -1,21 +1,26 @@
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip git ffmpeg libgl1 libglib2.0-0 \
-    build-essential cython3 \
+    git ffmpeg libgl1 libglib2.0-0 build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone https://github.com/pq-yang/MatAnyone2 /app/MatAnyone2
+# Install SAM2
+RUN pip install --no-cache-dir \
+    "git+https://github.com/facebookresearch/sam2.git" \
+    opencv-python-headless \
+    rembg \
+    onnxruntime \
+    pillow \
+    numpy \
+    runpod
 
-COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
-RUN pip3 install --no-cache-dir -e /app/MatAnyone2
-
+# Download SAM2 weights at build time
+RUN mkdir -p /app/weights
 COPY download_weights.py .
-RUN python3 download_weights.py
+RUN python download_weights.py
 
 COPY handler.py .
 
-CMD ["python3", "handler.py"]
+CMD ["python", "handler.py"]

@@ -1,14 +1,17 @@
 import os
 import urllib.request
 
-os.makedirs("/app/pretrained_models", exist_ok=True)
+os.makedirs("/app/weights", exist_ok=True)
 
-WEIGHTS_URL = "https://github.com/pq-yang/MatAnyone2/releases/download/v1.0.0/matanyone2.pth"
-DEST = "/app/pretrained_models/matanyone2.pth"
+WEIGHTS = {
+    "sam2.1_hiera_large.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
+}
 
-if not os.path.exists(DEST):
-    print("Downloading MatAnyone2 weights (~300MB)...")
-    urllib.request.urlretrieve(WEIGHTS_URL, DEST)
-    print("Done.")
-else:
-    print("Weights already present, skipping download.")
+for filename, url in WEIGHTS.items():
+    dest = f"/app/weights/{filename}"
+    if not os.path.exists(dest):
+        print(f"Downloading {filename}...")
+        urllib.request.urlretrieve(url, dest)
+        print("Done.")
+    else:
+        print(f"{filename} already exists, skipping.")
